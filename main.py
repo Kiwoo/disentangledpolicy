@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -8,9 +8,10 @@ import tensorflow as tf
 import random
 import os
 from scipy.misc import imsave
+import gym
 
-from vae import VariationalAutoencoder
-from data_manager import DataManager
+from build_model import LatentRL
+# from data_manager import DataManager
 
 tf.app.flags.DEFINE_float("beta", 4.0, "beta parameter for latent loss")
 tf.app.flags.DEFINE_integer("epoch_size", 2000, "epoch size")
@@ -147,29 +148,38 @@ def load_checkpoints(sess):
   return saver
 
 
-def main(argv):
-  manager = DataManager()
-  manager.load()
+def main(env_id):
 
-  sess = tf.Session()
+  import tf_util as U
+
+  sess = U.single_threaded_session()
+  sess.__enter__()
+
+  env = gym.make(env_id)
+
+  print(env.observation_space.shape)
   
-  model = VariationalAutoencoder(learning_rate=flags.learning_rate,
-                                 beta=flags.beta)
+  model = LatentRL(ob_space=env.observation_space, 
+                  ac_space=env.action_space,
+                  num_control = 5,
+                  learning_rate=flags.learning_rate,
+                  beta=flags.beta)
   
   sess.run(tf.global_variables_initializer())
 
   saver = load_checkpoints(sess)
 
-  if flags.training:
-    # Train
-    train(sess, model, manager, saver)
-  else:
-    reconstruct_check_images = manager.get_random_images(10)
-    # Image reconstruction check
-    reconstruct_check(sess, model, reconstruct_check_images)
-    # Disentangle check
-    disentangle_check(sess, model, manager)
+  # if flags.training:
+  #   # Train
+  #   train(sess, model, manager, saver)
+  # else:
+  #   reconstruct_check_images = manager.get_random_images(10)
+  #   # Image reconstruction check
+  #   reconstruct_check(sess, model, reconstruct_check_images)
+  #   # Disentangle check
+  #   disentangle_check(sess, model, manager)
   
 
 if __name__ == '__main__':
-  tf.app.run()
+  env_id = "Hopper-v1"
+  main(env_id= env_id)
