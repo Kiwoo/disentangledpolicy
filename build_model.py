@@ -9,6 +9,8 @@ from __future__ import print_function
 import numpy as np
 import tensorflow as tf
 import tf_util as U
+import gym
+from distributions import make_pdtype
 
 def xavier_init(fan_in, fan_out, constant=1): 
   """ Xavier initialization of network weights"""
@@ -24,27 +26,32 @@ def xavier_init(fan_in, fan_out, constant=1):
 class LatentRL(object):
   """ Variation Autoencoder """
   def __init__(self,
+               name,
                ob_space,
                ac_space,
                num_control,
-               learning_rate,
-               beta):
+               beta
+               ):
+    with tf.variable_scope(name):
+        self._init(ob_space, ac_space, num_control, beta)
+        self.scope = tf.get_variable_scope().name
 
+  def _init(self, ob_space, ac_space, num_control):
     self._ob_space  = ob_space
     self._ac_space  = ac_space
     self.pdtype     = make_pdtype(ac_space)
 
     self._create_network()
-    self._prepare_loss(learning_rate, beta)
+    self._prepare_latent_loss()   
 
   def _create_network(self):
 
-    n_hidden_encode   = [32, 32]
-    n_hidden_v        = [16, 16]
-    n_hidden_mlp      = [32]
+    n_hidden_encode   = [15, 15]
+    n_hidden_v        = [10, 10]
+    n_hidden_mlp      = [10, 10]
     n_input           = self._ob_space.shape
     n_z               = 10
-    n_w               = 4         # Need to test with value, 
+    n_w               = 7         # Need to test with value, 
     n_v               = n_z - n_w # Conditionally independent variables, from beta-VAE
     n_t               = 5        # task specific output size
 
@@ -91,20 +98,22 @@ class LatentRL(object):
     self.z_v = self.z[:, n_w:]
 
     self.v_task = self._create_task_network(hidden_layers=n_hidden_v, out_sz = n_t)
-    self.pol_in = tf.concat([self.z_w, self.v_task], axis=1)
+    self.feat_in = tf.concat([self.z_w, self.v_task], axis=1)
 
-    self.vpred  = 
-    self.
+    self.vpred, self.pd = self._create_policy_network(hidden_layers=n_hidden_mlp, ac_out_sz = pdtype.param_shape()[0]//2)
 
+    stochastic = tf.placeholder(name = "stochastic", dtype=tf.bool, shape=())
+    ac = U.switch(stochastic, self.pd.sample(), self.pd.mode()) 
 
+    self._act = U.function([stochastic, ob], [ac, self.vpred])
 
-    self._create_decoder_network(network_weights["weights_decode"],
-                                   network_weights["biases_decode"])
+    # self._create_decoder_network(network_weights["weights_decode"],
+    #                                network_weights["biases_decode"])
     
 
-    self.x_reconstr_mean_logit, self.x_reconstr_mean = \
-      self._create_decoder_network(network_weights["weights_decode"],
-                                   network_weights["biases_decode"])
+    # self.x_reconstr_mean_logit, self.x_reconstr_mean = \
+    #   self._create_decoder_network(network_weights["weights_decode"],
+    #                                network_weights["biases_decode"])
 
   
   def _create_encoder_network(self, hidden_layers, latent_sz):
@@ -132,19 +141,28 @@ class LatentRL(object):
     for (i, hid_size) in enumerate(hidden_layers):
         last_out    = tf.nn.tanh(U.dense(last_out, hid_size, "task%i"%(i+1), weight_init=U.normc_initializer(1.0)))
 
-    out = tf.nn.tanh(U.dense(last_out, out_sz, "task_final", weight_init=U.normc_initializer(1.0)))  
+    out = tf.nn.tanh(U.dense(last_out, out_sz, "taskfinal", weight_init=U.normc_initializer(1.0)))  
 
     return out 
 
-  def _create_core_mlp_network(self, hidden_layers, out_sz):
-    last_out = self.z_w
+  def _create_policy_network(self, hidden_layers, ac_out_sz):
+    last_out = self.feat_in
     for (i, hid_size) in enumerate(hidden_layers):
-        last_out    = tf.nn.tanh(U.dense(last_out, hid_size, "core_mlp%i"%(i+1), weight_init=U.normc_initializer(1.0)))
+        last_out    = tf.nn.tanh(U.dense(last_out, hid_size, "vffc%i"%(i+1), weight_init=U.normc_initializer(1.0)))
 
-    out = tf.nn.tanh(U.dense(last_out, out_sz, "core_mlp_final", weight_init=U.normc_initializer(1.0)))  
+    vpred = U.dense(last_out, ac_out_sz, "vffinal", weight_init=U.normc_initializer(1.0))  
 
-    return out 
+    last_out = self.feat_in
+    for (i, hid_size) in enumerate(hidden_layers):
+        last_out    = tf.nn.tanh(U.dense(last_out, hid_size, "polfc%i"%(i+1), weight_init=U.normc_initializer(1.0)))
 
+    mean = U.dense(last_out, ac_out_sz, "polfinal", weight_init=U.normc_initializer(1.0))
+    logstd = tf.get_variable(name="logstd", shape=[1, pdtype.param_shape()[0]//2], initializer=tf.zeros_initializer())
+    pdparam = U.concatenate([mean, mean * 0.0 + logstd], axis=1)
+
+    pd = pdtype.pdfromflat(pdparam)   
+
+    return (vpred, pd) 
 
   def _create_decoder_network(self, weights, biases):
     layer_1 = tf.tanh(tf.add(tf.matmul(self.z,  weights['h1']), biases['b1']))
@@ -154,6 +172,26 @@ class LatentRL(object):
                                    biases['out_mean'])
     x_reconstr_mean = tf.nn.sigmoid(x_reconstr_mean_logit)
     return x_reconstr_mean_logit, x_reconstr_mean
+
+  def _prepare_latent_loss(self):
+    latent_loss = beta * -0.5 * tf.reduce_sum(1 + self.z_log_sigma_sq 
+                                              - tf.square(self.z_mean)
+                                              - tf.exp(self.z_log_sigma_sq), 1)
+    self.latent_loss = latent_loss
+
+  def act(self, stochastic, ob):
+      ac1, vpred1 =  self._act(stochastic, ob[None])
+      return ac1[0], vpred1[0]
+
+  def get_variables(self):
+      return tf.get_collection(tf.GraphKeys.VARIABLES, self.scope)
+
+  def get_trainable_variables(self):
+      return tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, self.scope)
+
+  def get_initial_state(self):
+      return []
+
       
   def _prepare_loss(self, learning_rate, beta):
     # reconstruction loss (the negative log probability)
@@ -186,7 +224,7 @@ class LatentRL(object):
       return loss, summary_str
       
   
-  def transform(self, sess, X):
+  def Transform(self, sess, X):
     """Transform data by mapping it into the latent space."""
     return sess.run( [self.z_mean, self.z_log_sigma_sq],
                      feed_dict={self.x: X} )

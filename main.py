@@ -25,6 +25,12 @@ flags = tf.app.flags.FLAGS
 
 SUMMARY_INTERVAL = 100
 
+
+  
+
+
+
+
 def train(sess,
           model,
           manager,
@@ -148,6 +154,229 @@ def load_checkpoints(sess):
   return saver
 
 
+def trpo_train(env, manager, saver,
+              timesteps_per_batch = 1024, # what to train on
+              max_kl = 0.01, 
+              cg_iters = 10,
+              gamma = 0.99, 
+              lam = 0.98, # advantage estimation
+              lr = 1e-4,
+              vf_batch_size = 64,
+              entcoeff=0.0,
+              cg_damping=1e-2,
+              vf_stepsize=3e-4,
+              vf_iters =3,
+              max_timesteps=0, max_episodes=0, max_iters=0,  # time constraint
+              callback=None,
+              save_data_freq = 100,
+              save_model_freq = 100
+              ):
+  ob_space  = env.observation_space
+  ac_space  = env.action_space
+  num_control = 5 # should be changed to len(env_list)
+  beta      = 4
+  pi        = policy_func("pi", ob_space, ac_space, num_control, beta)
+  oldpi     = policy_func("oldpi", ob_space, ac_space, num_control, beta)
+  atarg     = tf.placeholder(dtype=tf.float32, shape=[None]) # Target advantage function (if applicable)
+  ret       = tf.placeholder(dtype=tf.float32, shape=[None]) # Empirical return
+
+  ob        = U.get_placeholder_cached(name="ob")
+  c_in      = U.get_placeholder_cached(name="c_in") 
+  ac        = pi.pdtype.sample_placeholder([None])
+
+  kloldnew  = oldpi.pd.kl(pi.pd)
+  ent       = pi.pd.entropy()
+  meankl    = U.mean(kloldnew)
+  meanent   = U.mean(ent)
+  entbonus  = entcoeff * meanent
+
+  vferr     = U.mean(tf.square(pi.vpred - ret))
+
+  ratio     = tf.exp(pi.pd.logp(ac) - oldpi.pd.logp(ac)) # advantage * pnew / pold
+  surrgain  = U.mean(ratio * atarg)
+
+  optimgain = surrgain + entbonus
+  latent_loss = pi.latent_loss
+  losses    = [optimgain, meankl, entbonus, surrgain, meanent, latent_loss]
+  loss_names = ["optimgain", "meankl", "entloss", "surrgain", "entropy", "latent_loss"]
+
+  dist      = meankl
+
+  all_var_list  = pi.get_trainable_variables()
+  
+  var_list      = [v for v in all_var_list if v.name.split("/")[1].startswith("pol")]
+  vf_var_list   = [v for v in all_var_list if v.name.split("/")[1].startswith("vf")]
+  enc_var_list  = [v for v in all_var_list if v.name.split("/")[1].startswith("enc")]
+  task_var_list = [v for v in all_var_list if v.name.split("/")[1].startswith("task")]
+
+  optimizer     = tf.train.AdamOptimizer(learning_rate=lr, epsilon = 0.01/vf_batch_size)
+
+  get_flat      = U.GetFlat(var_list)
+  set_from_flat = U.SetFromFlat(var_list)
+  klgrads       = tf.gradients(dist, var_list)
+
+  flat_tangent  = tf.placeholder(dtype=tf.float32, shape=[None], name="flat_tan")
+  shapes        = [var.get_shape().as_list() for var in var_list]
+  start         = 0
+  tangents      = []
+
+  for shape in shapes:
+    sz = U.intprod(shape)
+    tangents.append(tf.reshape(flat_tangent[start:start+sz], shape))
+    start += sz
+
+  gvp   = tf.add_n([U.sum(g*tangent) for (g, tangent) in zipsame(klgrads, tangents)]) #pylint: disable=E1111
+  fvp   = U.flatgrad(gvp, var_list)
+
+  assign_old_eq_new = U.function([],[], updates=[tf.assign(oldv, newv)
+    for (oldv, newv) in zipsame(oldpi.get_variables(), pi.get_variables())])
+
+  compute_losses = U.function([ob, ac, atarg], losses)
+  compute_lossandgrad = U.function([ob, ac, atarg], losses + [U.flatgrad(optimgain, var_list)])
+  compute_fvp = U.function([flat_tangent, ob, ac, atarg], fvp)
+  compute_vflossandgrad = U.function([ob, ret], U.flatgrad(vferr, vf_var_list))
+
+  vf_optimize_expr = optimizer.minimize(vferr, var_list=vf_var_list)
+  vf_train = U.function([ob, ret], vferr, updates = [vf_optimize_expr])
+
+
+  U.initialize()
+  th_init = get_flat()
+  set_from_flat(th_init)
+
+  seg_gen = traj_segment_generator(pi, env, timesteps_per_batch, stochastic=True)
+
+  episodes_so_far = 0
+  timesteps_so_far = 0
+  iters_so_far = 0
+
+  assert sum([max_iters>0, max_timesteps>0, max_episodes>0])==1
+
+  iter_log = []
+  epis_log = []
+  timestep_log = []
+  ret_mean_log = []
+  ret_std_log = []
+
+  saver = tf.train.Saver()
+  meta_saved = False
+
+
+  while True:        
+    if callback: callback(locals(), globals())
+    if max_timesteps and timesteps_so_far >= max_timesteps:
+      print "Max Timestep : {}".format(timesteps_so_far)
+      break
+    elif max_episodes and episodes_so_far >= max_episodes:
+      print "Max Episodes : {}".format(episodes_so_far)
+      break
+    elif max_iters and iters_so_far >= max_iters:
+      print "Max Iter : {}".format(iters_so_far)
+      break
+    warn("********** Iteration %i ************"%iters_so_far)
+
+    # with timed("sampling"):
+    #       seg = seg_gen.__next__()
+    seg = traj_segment_generator(pi, env, timesteps_per_batch, stochastic=True)
+    add_vtarg_and_adv(seg, gamma, lam)
+
+    # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
+    ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
+    vpredbefore = seg["vpred"] # predicted value function before udpate
+    atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
+
+    if hasattr(pi, "ret_rms"): pi.ret_rms.update(tdlamret)
+    if hasattr(pi, "ob_rms"): pi.ob_rms.update(ob) # update running mean/std for policy
+
+    args = seg["ob"], seg["ac"], seg["adv"]
+    fvpargs = [arr[::5] for arr in args]
+    def fisher_vector_product(p):
+      return compute_fvp(p, *fvpargs) + cg_damping * p
+
+    assign_old_eq_new()
+    surrbefore, _,_,_,_, g = compute_lossandgrad(*args)
+    surrbefore = np.array(surrbefore)
+    if np.allclose(g, 0):
+      print("Got zero gradient. not updating")
+    else:
+      stepdir = U.conjugate_gradient(fisher_vector_product, g, cg_iters=cg_iters)
+      assert np.isfinite(stepdir).all()
+      shs = .5*stepdir.dot(fisher_vector_product(stepdir))
+      lm = np.sqrt(shs / max_kl)
+      fullstep = stepdir / lm
+      expectedimprove = g.dot(fullstep)
+      stepsize = 1.0
+      thbefore = get_flat()
+      for _ in range(10):
+        thnew = thbefore + fullstep * stepsize
+        set_from_flat(thnew)
+        meanlosses = surr, kl, _,_,_ = np.array(compute_losses(*args))
+        improve = surr - surrbefore
+        if not np.isfinite(meanlosses).all():
+          print("Got non-finite value of losses -- bad!")
+        elif kl > max_kl * 1.5:
+          print("violated KL constraint. shrinking step.")
+        elif improve < 0:
+          print("surrogate didn't improve. shrinking step.")
+        else:
+          break
+          stepsize *= .5
+      else:
+        print("couldn't compute a good step")
+        set_from_flat(thbefore)
+
+    for _ in range(vf_iters):
+      for (mbob, mbret) in dataset.iterbatches((seg["ob"], seg["tdlamret"]), 
+        include_final_partial_batch=False, batch_size=64):
+        vfloss = vf_train(mbob, mbret)
+
+
+    episodes_so_far += len(seg["ep_lens"])
+    timesteps_so_far += sum(seg["ep_lens"])
+    iters_so_far += 1
+
+    mean_ret = np.mean(seg["ep_rets"])
+    std_ret = np.std(seg["ep_rets"])
+
+
+    iter_log.append(iters_so_far)
+    epis_log.append(episodes_so_far)
+    timestep_log.append(timesteps_so_far)
+    ret_mean_log.append(mean_ret)
+    ret_std_log.append(std_ret)
+
+    if iters_so_far % save_model_freq == 1:
+      if meta_saved == True:
+        saver.save(U.get_session(), 'my_test_model', global_step = iters_so_far, write_meta_graph = False)
+      else:
+        print "Save  meta graph"
+        saver.save(U.get_session(), 'my_test_model', global_step = iters_so_far, write_meta_graph = True)
+        meta_saved = True
+
+
+    if iters_so_far % save_data_freq == 1:
+      iter_log_d = pd.DataFrame(iter_log)
+      epis_log_d = pd.DataFrame(epis_log)
+      timestep_log_d = pd.DataFrame(timestep_log)
+      ret_mean_log_d = pd.DataFrame(ret_mean_log)
+      ret_std_log_d = pd.DataFrame(ret_std_log)
+
+      save_file = "test_iter_{}.h5".format(iters_so_far)
+      with pd.HDFStore(save_file, 'w') as outf:
+        outf['iter_log'] = iter_log_d
+        outf['epis_log'] = epis_log_d
+        outf['timestep_log'] = timestep_log_d
+        outf['ret_mean_log'] = ret_mean_log_d
+        outf['ret_std_log'] = ret_std_log_d
+        
+        filesave('Wrote {}'.format(save_file))
+
+    header('iters_so_far : {}'.format(iters_so_far))
+    header('timesteps_so_far : {}'.format(timesteps_so_far))
+    header('mean_ret : {}'.format(mean_ret))
+    header('std_ret : {}'.format(std_ret))
+
+
 def main(env_id):
 
   import tf_util as U
@@ -158,20 +387,16 @@ def main(env_id):
   env = gym.make(env_id)
 
   print(env.observation_space.shape)
-  
-  model = LatentRL(ob_space=env.observation_space, 
-                  ac_space=env.action_space,
-                  num_control = 5,
-                  learning_rate=flags.learning_rate,
-                  beta=flags.beta)
-  
-  sess.run(tf.global_variables_initializer())
+
+  def policy_fn(name, ob_space, ac_space, num_control, beta):
+        return LatentRL(name=name, ob_space=env.observation_space, ac_space=env.action_space, num_control=num_control, beta = beta)
+
 
   saver = load_checkpoints(sess)
 
   # if flags.training:
   #   # Train
-  #   train(sess, model, manager, saver)
+  trpo_train(env, policy_fn, manager, saver)
   # else:
   #   reconstruct_check_images = manager.get_random_images(10)
   #   # Image reconstruction check
